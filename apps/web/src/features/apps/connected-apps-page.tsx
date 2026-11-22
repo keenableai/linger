@@ -323,6 +323,7 @@ function CatalogAppCard({
                 "truncate",
                 !connectedLabel && authorizing && "town-shimmer-text",
               )}
+              title={connectedLabel ?? summary}
             >
               {connectedLabel ?? summary}
             </span>

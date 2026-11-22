@@ -1,12 +1,18 @@
+import type { components } from "@linger/wire-contracts/teamhub-public/types";
 import { queryOptions } from "@tanstack/react-query";
 
 import { collectTeamHubCursorPages } from "@/features/teamhub/teamhub-cursor-pages";
 import { TeamHubError } from "@/features/teamhub/teamhub-error";
-import { teamHubData } from "@/features/teamhub/teamhub-api";
-import type { TeamHubClient } from "@/features/teamhub/teamhub-client";
+import { idempotencyHeader, teamHubData } from "@/features/teamhub/teamhub-api";
+import {
+  createTeamHubIdempotencyKey,
+  type TeamHubClient,
+} from "@/features/teamhub/teamhub-client";
 import { translate } from "@/i18n/language";
 
 import { workItemsMessages as m } from "./work-items.messages";
+
+export type TeamHubWorkItemComment = components["schemas"]["WorkItemComment"];
 
 export function tenantWorkItemTargetQueryKey(
   tenantId: string,
@@ -118,4 +124,54 @@ export function tenantWorkItemsDashboardQueryOptions(
     refetchOnWindowFocus: true,
     staleTime: 0,
   });
+}
+
+export function tenantWorkItemCommentsQueryKey(
+  tenantId: string,
+  workItemId: string,
+) {
+  return ["teamhub", tenantId, "work-items", "comments", workItemId] as const;
+}
+
+export function tenantWorkItemCommentsQueryOptions(
+  client: Pick<TeamHubClient, "api">,
+  tenantId: string,
+  workItemId: string,
+) {
+  return queryOptions({
+    queryFn: () =>
+      collectTeamHubCursorPages((pagination) =>
+        teamHubData(
+          client.api.GET("/v0/work-items/{workItemId}/comments", {
+            params: {
+              path: { workItemId },
+              query: pagination,
+            },
+          }),
+        ),
+      ),
+    queryKey: tenantWorkItemCommentsQueryKey(tenantId, workItemId),
+    refetchOnWindowFocus: true,
+    staleTime: 0,
+  });
+}
+
+export function createWorkItemComment(
+  client: Pick<TeamHubClient, "api">,
+  workItemId: string,
+  body: string,
+) {
+  const content = body.trim();
+  return teamHubData(
+    client.api.POST("/v0/work-items/{workItemId}/comments", {
+      body: {
+        body: content,
+        segments: [{ content, type: "text" }],
+      },
+      params: {
+        header: idempotencyHeader(createTeamHubIdempotencyKey()),
+        path: { workItemId },
+      },
+    }),
+  );
 }

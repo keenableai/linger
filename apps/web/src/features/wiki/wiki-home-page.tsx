@@ -88,9 +88,10 @@ export function editedLabel(page: TeamHubDocument, t: Translate = translate) {
 }
 
 /** Graph nodes by Wiki page key; descriptions and links feed the cards. */
-export function useWikiGraphNodes(tenantId: string) {
+export function useWikiGraphNodes(tenantId: string, enabled = true) {
   const { client } = useTeamHubRuntime();
   const graph = useQuery({
+    enabled,
     queryFn: () => client.getPersonalKnowledgeGraphVisualization(tenantId),
     queryKey: ["teamhub", tenantId, "personal-wiki", "graph"],
     retry: false,
@@ -222,7 +223,7 @@ function WikiOverview({
   const { preview, refreshing } = refresh;
   const navigate = useNavigate();
   const collections = useWikiCollectionPages(tenantId);
-  const nodes = useWikiGraphNodes(tenantId);
+  const nodes = useWikiGraphNodes(tenantId, refresh.hasPublishedWiki);
   const reports = usePeriodReports(tenantId, "daily");
   const previews = useMemo(() => wikiPreviewPages(preview), [preview]);
   const anotherMe = useAnotherMeActorId(tenantId);

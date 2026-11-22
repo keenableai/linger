@@ -68,8 +68,8 @@ export function WikiCollectionPage() {
 function WikiCollectionContent({ collection }: { collection: WikiCollection }) {
   const tenantId = requireRoomRouteParam(useParams().tenantId, "Tenant");
   const collections = useWikiCollectionPages(tenantId);
-  const nodes = useWikiGraphNodes(tenantId);
-  const { preview } = usePersonalWikiRefresh(tenantId);
+  const { hasPublishedWiki, preview } = usePersonalWikiRefresh(tenantId);
+  const nodes = useWikiGraphNodes(tenantId, hasPublishedWiki);
   const previews = useMemo(() => wikiPreviewPages(preview), [preview]);
   const [query, setQuery] = useState("");
   const t = useT();

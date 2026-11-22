@@ -148,7 +148,7 @@ export default function PocketNotePanel({
       className="app-floating-enter fixed z-[100] flex h-[440px] flex-col overflow-hidden rounded-2xl bg-popover shadow-xl"
       ref={panelRef}
       role="dialog"
-      style={{ ...position, width: panelWidth }}
+      style={position}
     >
       {!firstPage || !today ? (
         <p className="m-auto text-sm text-app-muted">
@@ -708,7 +708,7 @@ function HeaderButton({
   );
 }
 
-/** Opens beside the sidebar row and stays inside the viewport. */
+/** Opens beneath its trigger over the sidebar column so the chat stays readable. */
 function usePanelPosition(
   anchorRef: RefObject<HTMLButtonElement | null>,
 ): CSSProperties {
@@ -716,26 +716,30 @@ function usePanelPosition(
     left: 0,
     top: 0,
     visibility: "hidden",
+    width: panelWidth,
   });
   useLayoutEffect(() => {
     function place() {
-      // Open beside the whole navigation column, not over it.
-      const anchor = (
-        anchorRef.current?.closest(".app-secondary-navigation") ??
-        anchorRef.current
-      )?.getBoundingClientRect();
+      const sidebar = anchorRef.current
+        ?.closest(".app-secondary-navigation")
+        ?.getBoundingClientRect();
       const trigger = anchorRef.current?.getBoundingClientRect();
-      if (!anchor || !trigger) return;
+      if (!trigger) return;
       const height = 440;
-      const left = Math.min(
-        anchor.right + panelGap,
-        window.innerWidth - panelWidth - panelGap,
+      const width = Math.min(
+        panelWidth,
+        Math.max(240, window.innerWidth - panelGap * 2),
+      );
+      const preferredLeft = sidebar ? sidebar.left : trigger.left;
+      const left = Math.max(
+        panelGap,
+        Math.min(preferredLeft, window.innerWidth - width - panelGap),
       );
       const top = Math.max(
         panelGap,
-        Math.min(trigger.top - 24, window.innerHeight - height - panelGap),
+        Math.min(trigger.bottom + 8, window.innerHeight - height - panelGap),
       );
-      setPosition({ left: Math.max(panelGap, left), top });
+      setPosition({ left, top, width });
     }
     place();
     window.addEventListener("resize", place);

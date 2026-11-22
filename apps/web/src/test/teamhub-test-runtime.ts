@@ -1171,6 +1171,12 @@ function installSeedRoutes(server: TeamHubTestServer, seed: TeamHubTestSeed) {
         seed.workItems.find((item) => item.id === params.workItemId) ??
         notFound("WORK_ITEM_NOT_FOUND"),
     )
+    .on("GET", "/v0/work-items/{workItemId}/comments", ({ params }) => {
+      const exists = seed.workItems.some(
+        (item) => item.id === params.workItemId,
+      );
+      return exists ? page([]) : notFound("WORK_ITEM_NOT_FOUND");
+    })
     .on("GET", "/v0/rooms/{roomId}/team-md", ({ params }) =>
       params.roomId === "room-all" ? seedTeamMd : notFound("NOT_FOUND"),
     )

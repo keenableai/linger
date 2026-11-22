@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { requireRoomRouteParam } from "@/features/rooms/room-route-params";
 import { TeamHubError } from "@/features/teamhub/teamhub-error";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
+import { commonMessages } from "@/i18n/common.messages";
 import type { Translate } from "@/i18n/language";
 import { useT } from "@/i18n/use-translation";
 
@@ -67,7 +68,9 @@ export function WikiGraphPage() {
       ? { kind: "daily", day: initialDay }
       : undefined,
   );
+  const refresh = usePersonalWikiRefresh(tenantId);
   const graph = useQuery({
+    enabled: refresh.hasPublishedWiki,
     queryFn: () => client.getPersonalKnowledgeGraphVisualization(tenantId),
     queryKey: ["teamhub", tenantId, "personal-wiki", "graph"],
   });
@@ -85,8 +88,10 @@ export function WikiGraphPage() {
     () => (filteredGraph ? nodeMoments(filteredGraph) : undefined),
     [filteredGraph],
   );
-  const refresh = usePersonalWikiRefresh(tenantId);
   const graphBusy = refresh.refreshing || graph.isFetching;
+  const statusFailed = Boolean(refresh.statusError && !graph.data);
+  const timelineError =
+    (statusFailed ? refresh.statusError : null) ?? graph.error;
 
   return (
     <main className="wiki-graph-page flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-app-surface">
@@ -105,9 +110,10 @@ export function WikiGraphPage() {
       </div>
 
       <section className="min-h-0 flex-1 overflow-hidden p-3 md:p-4">
-        {graph.isPending ||
+        {refresh.statusPending ||
+        (refresh.hasPublishedWiki && graph.isPending) ||
         (refresh.initializing && !graph.data) ||
-        (graphBusy && !graph.data && !graph.error) ? (
+        (graphBusy && !graph.data && !timelineError) ? (
           <div
             aria-busy="true"
             className="flex h-full min-h-[480px] items-center justify-center gap-2 text-sm text-app-muted"
@@ -121,9 +127,9 @@ export function WikiGraphPage() {
                 : t(wikiMessages.loadingTimeline)}
             </span>
           </div>
-        ) : graph.error ? (
+        ) : timelineError ? (
           <div
-            aria-label={graphErrorText(graph.error, t)}
+            aria-label={graphErrorText(timelineError, t)}
             className="flex h-full min-h-[480px] flex-col items-center justify-center text-center"
             role="alert"
           >
@@ -133,16 +139,35 @@ export function WikiGraphPage() {
               size={24}
             />
             <p className="text-sm text-app-danger">
-              {graphErrorText(graph.error, t)}
+              {graphErrorText(timelineError, t)}
             </p>
             <Button
               className="mt-3"
-              onClick={() => void graph.refetch()}
+              disabled={
+                statusFailed ? refresh.statusFetching : graph.isFetching
+              }
+              onClick={() => {
+                if (statusFailed) {
+                  void refresh.refetchStatus();
+                  return;
+                }
+                void graph.refetch();
+              }}
               size="compact"
               tone="secondary"
             >
-              <Icon icon={RefreshIcon} size={14} /> {t(m.retryGraph)}
+              <Icon icon={RefreshIcon} size={14} />{" "}
+              {t(statusFailed ? commonMessages.retry : m.retryGraph)}
             </Button>
+          </div>
+        ) : !refresh.hasPublishedWiki && !graph.data ? (
+          <div className="flex h-full min-h-[480px] flex-col items-center justify-center text-center">
+            <Icon
+              icon={HierarchySquare01Icon}
+              className="mb-3 text-app-muted"
+              size={24}
+            />
+            <p className="text-sm text-app-muted">{t(m.emptyTimeline)}</p>
           </div>
         ) : filteredGraph ? (
           <WikiKnowledgeGraph

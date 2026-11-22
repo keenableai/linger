@@ -11,7 +11,7 @@ import { formatLocale } from "@/i18n/language";
 import type { Message } from "@/i18n/messages";
 import { useT, useTranslation } from "@/i18n/use-translation";
 import { useCallback, useState, type RefCallback } from "react";
-import { Link, useParams, useSearchParams } from "react-router";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
 import { Button } from "@/components/ui/button";
 import { Select, SelectItem } from "@/components/ui/select";
@@ -27,7 +27,8 @@ import {
   tenantWorkItemTargetQueryOptions,
   tenantWorkItemsDashboardQueryOptions,
 } from "./work-item-queries";
-import { dashboardWorkItemPath } from "./work-item-routes";
+import { WorkItemDetailDrawer } from "./work-item-detail-drawer";
+import { dashboardPath, dashboardWorkItemPath } from "./work-item-routes";
 import { createWorkItemRoomFilterModel } from "./work-item-room-filter";
 import { workItemsMessages as m } from "./work-items.messages";
 
@@ -46,6 +47,7 @@ const dashboardColumns: readonly DashboardColumn[] = [
 export function WorkItemsPage() {
   const t = useT();
   const { client } = useTeamHubRuntime();
+  const navigate = useNavigate();
   const params = useParams();
   const tenantId = requireRoomRouteParam(params.tenantId, "Tenant");
   const focusedWorkItemId = params.workItemId;
@@ -56,6 +58,16 @@ export function WorkItemsPage() {
     [focusedWorkItemId],
   );
   const [searchParams, setSearchParams] = useSearchParams();
+  const roomId = searchParams.get("room")?.trim() ?? "";
+  const dashboardSearch = roomId
+    ? new URLSearchParams({ room: roomId }).toString()
+    : "";
+  const closeDetail = useCallback(() => {
+    void navigate({
+      pathname: dashboardPath(tenantId),
+      search: dashboardSearch,
+    });
+  }, [dashboardSearch, navigate, tenantId]);
   const workItemsQuery = useQuery(
     tenantWorkItemsDashboardQueryOptions(client, tenantId),
   );
@@ -69,10 +81,14 @@ export function WorkItemsPage() {
   });
   const roomsQuery = useQuery(tenantRoomsQueryOptions(client, tenantId));
 
+  const hasFocusedInBoard = Boolean(
+    focusedWorkItemId &&
+    workItemsQuery.data?.items.some((item) => item.id === focusedWorkItemId),
+  );
   if (
     workItemsQuery.isPending ||
     roomsQuery.isPending ||
-    (focusedWorkItemId && focusedWorkItemQuery.isPending)
+    (focusedWorkItemId && !hasFocusedInBoard && focusedWorkItemQuery.isPending)
   ) {
     return <WorkItemsLoading />;
   }
@@ -100,11 +116,10 @@ export function WorkItemsPage() {
   const rooms = roomsQuery.data;
   if (!data || !rooms) return <WorkItemsLoading />;
   const items = mergeFocusedWorkItem(data.items, focusedWorkItemQuery.data);
+  const focusedWorkItem = focusedWorkItemId
+    ? items.find((item) => item.id === focusedWorkItemId)
+    : undefined;
   const roomFilter = createWorkItemRoomFilterModel(rooms.items, items, t);
-  const roomId = searchParams.get("room")?.trim() ?? "";
-  const dashboardSearch = roomId
-    ? new URLSearchParams({ room: roomId }).toString()
-    : "";
   const filteredItems = items.filter((item) =>
     roomFilter.matches(item, roomId),
   );
@@ -148,23 +163,37 @@ export function WorkItemsPage() {
       </header>
 
       {items.length ? (
-        <div className="work-items-board workspace-scrollbar min-h-0 flex-1 overflow-x-auto overflow-y-hidden p-4 sm:p-5">
-          <div className="grid h-full min-w-[1180px] grid-cols-5 gap-3">
-            {dashboardColumns.map((column) => (
-              <WorkItemColumn
-                column={column}
-                focusedCardRef={focusedCardRef}
-                focusedWorkItemId={focusedWorkItemId}
-                items={filteredItems.filter(
-                  (item) => dashboardColumnFor(item) === column.id,
-                )}
-                key={column.id}
-                originRoomLabel={roomFilter.originLabel}
-                search={dashboardSearch}
-                tenantId={tenantId}
-              />
-            ))}
+        <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden lg:flex-row">
+          <div className="work-items-board workspace-scrollbar min-h-0 min-w-0 flex-1 overflow-x-auto overflow-y-hidden p-4 sm:p-5">
+            <div className="grid h-full min-w-[960px] grid-cols-4 gap-3">
+              {dashboardColumns.map((column) => (
+                <WorkItemColumn
+                  column={column}
+                  focusedCardRef={focusedCardRef}
+                  focusedWorkItemId={focusedWorkItemId}
+                  items={filteredItems.filter(
+                    (item) => dashboardColumnFor(item) === column.id,
+                  )}
+                  key={column.id}
+                  originRoomLabel={roomFilter.originLabel}
+                  search={dashboardSearch}
+                  tenantId={tenantId}
+                />
+              ))}
+            </div>
           </div>
+          {focusedWorkItem ? (
+            <WorkItemDetailDrawer
+              item={focusedWorkItem}
+              onClose={closeDetail}
+              originRoomLabel={roomFilter.originLabel(focusedWorkItem)}
+              rooms={rooms.items}
+              statusBadge={
+                <WorkItemStatus status={dashboardColumnFor(focusedWorkItem)} />
+              }
+              tenantId={tenantId}
+            />
+          ) : null}
         </div>
       ) : (
         <section className="flex min-h-0 flex-1 items-center justify-center px-6 py-12 text-center">
