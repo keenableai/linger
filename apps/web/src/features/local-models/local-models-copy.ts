@@ -284,12 +284,45 @@ export function modelSourceErrorCopy(code: string | undefined, t: Translate) {
 
 // For these the Computer's own message names the address it sent to and the
 // endpoint's HTTP status, so it is shown as it is.
-const byokEndpointRefusals = new Set([
+const byokEndpointRefusalCodes = [
   "BYOK_AUTH_FAILED",
   "BYOK_NOT_FOUND",
   "BYOK_UNREACHABLE",
   "BYOK_UPSTREAM_REJECTED",
-]);
+] as const satisfies readonly Schemas["ModelSourceErrorCode"][];
+
+type ByokEndpointRefusalCode = (typeof byokEndpointRefusalCodes)[number];
+
+const byokEndpointRefusals: ReadonlySet<string> = new Set(
+  byokEndpointRefusalCodes,
+);
+
+// TeamHub falls back to these English summaries when the Computer supplied no
+// refusal detail; prefer the client's localized copy in those cases.
+const genericByokEndpointMessages: Record<ByokEndpointRefusalCode, string> = {
+  BYOK_AUTH_FAILED: "The endpoint rejected the API key",
+  BYOK_NOT_FOUND:
+    "Nothing answered at the endpoint address, or it does not serve this model",
+  BYOK_UNREACHABLE: "The Computer could not reach the endpoint",
+  BYOK_UPSTREAM_REJECTED: "The endpoint rejected the test request",
+};
+
+function isByokEndpointRefusalCode(
+  code: string,
+): code is ByokEndpointRefusalCode {
+  return byokEndpointRefusals.has(code);
+}
+
+function byokEndpointRefusalMessage(
+  code: string | undefined,
+  message: string | undefined,
+) {
+  if (!code || !isByokEndpointRefusalCode(code)) return undefined;
+  const trimmed = message?.trim();
+  if (!trimmed || trimmed === code) return undefined;
+  if (genericByokEndpointMessages[code] === trimmed) return undefined;
+  return trimmed;
+}
 
 /** Structured failure returned by TeamHub's model-source endpoints. */
 export interface ModelSourceFailure {
@@ -314,18 +347,23 @@ export function modelSourceFailureCopy(
       ? t(m.sourceByokGatewayFailedDetail, { detail })
       : t(m.sourceByokGatewayFailed);
   }
+  if (error?.code === "MODEL_SOURCE_UNCONFIRMED") {
+    return modelSourceErrorCopy(error.code, t);
+  }
   return byokFailureCopy(error?.code, error?.message ?? "", t);
 }
 
 /** Why a request to a BYOK endpoint (a test or a model listing) failed. */
 export function byokFailureCopy(
   code: string | undefined,
-  message: string,
+  message: string | undefined,
   t: Translate,
 ) {
-  return code && byokEndpointRefusals.has(code) && message
-    ? message
-    : modelSourceErrorCopy(code, t);
+  if (code === "MODEL_SOURCE_UNCONFIRMED" || code === "BYOK_CHECK_TIMEOUT") {
+    return t(m.sourceByokProbeUnconfirmed);
+  }
+  const detail = byokEndpointRefusalMessage(code, message);
+  return detail ?? modelSourceErrorCopy(code, t);
 }
 
 /** Why reading a Computer's model source failed. */

@@ -97,6 +97,19 @@ export function useModelSourceSwitch({
       });
       if (
         error instanceof TeamHubError &&
+        error.code === "LOCAL_COMPUTER_OFFLINE"
+      ) {
+        void Promise.all([
+          queryClient.invalidateQueries({
+            queryKey: localComputersQueryKey(tenantId),
+          }),
+          queryClient.invalidateQueries({
+            queryKey: tenantLocalModelsQueryKey(tenantId),
+          }),
+        ]);
+      }
+      if (
+        error instanceof TeamHubError &&
         error.code === "AGENT_HAS_ACTIVE_RUNS"
       )
         setBusy({

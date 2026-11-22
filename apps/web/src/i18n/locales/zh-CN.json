@@ -1424,6 +1424,7 @@
     "sourceForbidden": "只有连接这台电脑的人才能更改它的模型。",
     "sourceUnavailable": "这台电脑无法切换模型。请先更新它上面的 Linger，然后重试。",
     "sourceUnconfirmed": "这台电脑没有及时响应。它可能仍在切换，请一分钟后再查看。",
+    "sourceByokProbeUnconfirmed": "检查端点时，这台电脑没有及时响应，请重试。",
     "sourceRuntimeNotEnabled": "这台电脑上还没有设置这个 AI Runtime。",
     "sourceReadUnconfirmed": "这台电脑没有及时响应，请重试。",
     "sourceReadFailed": "无法读取这台电脑上 Agent 的模型来源，请重试。",

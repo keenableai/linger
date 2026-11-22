@@ -85,8 +85,12 @@ build:assets` to check the initial JS budget.
   Make room filters stale unloaded IDs out of `unload_first`, lists what else
   holds the pool (components, and other apps from `used_bytes` no holder
   accounts for) when unloading models cannot free enough, and says a model
-  cannot fit only when it needs more than the pool's total. A Computer's detail
-  on the Computers page links here and reads no model state itself.
+  cannot fit only when it needs more than the pool's total. Opening the page or
+  reconnecting an offline Computer auto-refreshes `model-source` and triggers a
+  fresh `POST .../local-models` memory snapshot for the owner, while
+  `LOCAL_COMPUTER_OFFLINE` disables BYOK edits immediately. A Computer's detail
+  on the Computers page links here, reads `model-source` for its active runtime
+  pill, and reads no local model library state itself.
 - `src/i18n`: the interface languages (English and Simplified Chinese).
   `messages.ts` re-exports the React-free core from
   `@linger/service-kit/messages`, which the desktop shell shares,

@@ -12,7 +12,7 @@ import {
   normalizeByokPath,
   validByokPath,
 } from "@linger/service-kit/byok-endpoint";
-import { useMutation } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   type CSSProperties,
   type FormEvent,
@@ -28,6 +28,7 @@ import { Button } from "@/components/ui/button";
 import { fieldControlClassName } from "@/components/ui/field";
 import { Icon } from "@/components/ui/icon";
 import { Select, SelectItem } from "@/components/ui/select";
+import { localComputersQueryKey } from "@/features/local-computer/local-computer-queries";
 import { TeamHubError } from "@/features/teamhub/teamhub-error";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
 import { commonMessages } from "@/i18n/common.messages";
@@ -47,12 +48,14 @@ import {
   modelSourceRuntimeLabels,
 } from "./local-models-copy";
 import { localModelsMessages as m } from "./local-models.messages";
+import { localModelsQueryKey } from "./local-models-queries";
 import type { ModelSourceSwitcher } from "./model-source-panel";
 import {
   type ByokEndpointInput,
   type ByokInput,
   type ByokTestRequest,
   listByokModels,
+  modelSourceQueryKey,
   type ModelSourceRuntime,
   type ModelSourceStatus,
   testByokEndpoint,
@@ -84,7 +87,102 @@ function fittedWidth(value: string): CSSProperties {
 const failureCopy = (error: unknown, t: Translate) =>
   error instanceof TeamHubError
     ? byokFailureCopy(error.code, error.message, t)
-    : byokFailureCopy(undefined, "", t);
+    : byokFailureCopy(undefined, undefined, t);
+
+type ProbeState<T> =
+  | { status: "idle" }
+  | { status: "pending" }
+  | { data: T; status: "success" }
+  | { error: unknown; status: "error" };
+
+interface ProbeCallbacks<Output> {
+  onSettled?: () => void;
+  onSuccess?: (data: Output) => void;
+}
+
+/**
+ * Runs one read-only BYOK probe at a time, aborting and ignoring any response
+ * superseded by an edit, a newer click, or unmount.
+ */
+function useByokProbe<Input, Output>({
+  onError,
+  probe,
+}: {
+  onError?: (error: unknown) => void;
+  probe: (input: Input, signal: AbortSignal) => Promise<Output>;
+}) {
+  const [state, setState] = useState<ProbeState<Output>>({ status: "idle" });
+  const generationRef = useRef(0);
+  const controllerRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      generationRef.current += 1;
+      controllerRef.current?.abort();
+      controllerRef.current = null;
+    };
+  }, []);
+
+  function cancel() {
+    generationRef.current += 1;
+    controllerRef.current?.abort();
+    controllerRef.current = null;
+  }
+
+  function reset() {
+    cancel();
+    setState((current) =>
+      current.status === "idle" ? current : { status: "idle" },
+    );
+  }
+
+  function cancelPending() {
+    if (!controllerRef.current) return;
+    reset();
+  }
+
+  function start(input: Input, callbacks?: ProbeCallbacks<Output>) {
+    cancel();
+    const generation = generationRef.current;
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    setState({ status: "pending" });
+
+    void probe(input, controller.signal).then(
+      (data) => {
+        if (
+          !mountedRef.current ||
+          controller.signal.aborted ||
+          generationRef.current !== generation
+        ) {
+          return;
+        }
+        controllerRef.current = null;
+        setState({ data, status: "success" });
+        callbacks?.onSuccess?.(data);
+        callbacks?.onSettled?.();
+      },
+      (error: unknown) => {
+        if (
+          !mountedRef.current ||
+          controller.signal.aborted ||
+          generationRef.current !== generation
+        ) {
+          return;
+        }
+        controllerRef.current = null;
+        setState({ error, status: "error" });
+        onError?.(error);
+        callbacks?.onSettled?.();
+      },
+    );
+  }
+
+  return { cancelPending, reset, start, state };
+}
 
 /**
  * The person's own endpoint, addressed as base URL + path + endpoint. The API
@@ -106,6 +204,7 @@ export function ByokPanel({
 }) {
   const t = useT();
   const { client } = useTeamHubRuntime();
+  const queryClient = useQueryClient();
   const saved = status.byok;
   const savedRuntime = status.mode === "byok" ? status.runtime : "claude";
   const [runtime, setRuntime] = useState<ModelSourceRuntime>(savedRuntime);
@@ -154,15 +253,37 @@ export function ByokPanel({
   const complete = base !== "" && input.model_id !== "" && addressValid;
   const active = status.mode === "byok";
 
-  const models = useMutation({
-    mutationFn: (body: ByokEndpointInput) =>
-      listByokModels(client, tenantId, computerId, body),
+  function syncOfflineIfNeeded(error: unknown) {
+    if (
+      error instanceof TeamHubError &&
+      error.code === "LOCAL_COMPUTER_OFFLINE"
+    ) {
+      void Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: localComputersQueryKey(tenantId),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: localModelsQueryKey(tenantId, computerId),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: modelSourceQueryKey(tenantId, computerId),
+        }),
+      ]);
+    }
+  }
+
+  const models = useByokProbe({
+    onError: syncOfflineIfNeeded,
+    probe: (body: ByokEndpointInput, signal: AbortSignal) =>
+      listByokModels(client, tenantId, computerId, body, signal),
   });
-  const test = useMutation({
-    mutationFn: (body: ByokTestRequest) =>
-      testByokEndpoint(client, tenantId, computerId, body),
+  const test = useByokProbe({
+    onError: syncOfflineIfNeeded,
+    probe: (body: ByokTestRequest, signal: AbortSignal) =>
+      testByokEndpoint(client, tenantId, computerId, body, signal),
   });
-  const listed = models.data?.models ?? [];
+  const listed =
+    models.state.status === "success" ? models.state.data.models : [];
   const modelOptions = listed.map((model) => ({
     detail:
       [
@@ -175,16 +296,17 @@ export function ByokPanel({
         .join(" · ") || undefined,
     value: model.id,
   }));
-  const modelHint = models.isPending
-    ? t(m.byokListingFrom, { url: modelsUrl })
-    : models.isError
-      ? failureCopy(models.error, t)
-      : models.data
-        ? t(m.byokModelsListedFrom, {
-            count: listed.length,
-            url: models.data.url,
-          })
-        : t(m.byokModelHint);
+  const modelHint =
+    models.state.status === "pending"
+      ? t(m.byokListingFrom, { url: modelsUrl })
+      : models.state.status === "error"
+        ? failureCopy(models.state.error, t)
+        : models.state.status === "success"
+          ? t(m.byokModelsListedFrom, {
+              count: listed.length,
+              url: models.state.data.url,
+            })
+          : t(m.byokModelHint);
 
   // Changing the address or key makes listed models and a test result stale;
   // changing only the endpoint, model or Runtime keeps the listed models.
@@ -199,6 +321,8 @@ export function ByokPanel({
 
   function save(event: FormEvent) {
     event.preventDefault();
+    models.cancelPending();
+    test.cancelPending();
     switcher.request({ byok: input, mode: "byok", runtime });
   }
 
@@ -418,21 +542,23 @@ export function ByokPanel({
             <Button
               aria-label={t(m.listModels)}
               disabled={disabled || base === "" || !addressValid}
-              loading={models.isPending}
+              loading={models.state.status === "pending"}
               onClick={() =>
-                models.mutate(address, { onSuccess: () => setMenu("model") })
+                models.start(address, { onSuccess: () => setMenu("model") })
               }
               size="large"
               title={t(m.listModels)}
             >
-              {models.isPending ? null : <Icon icon={RefreshIcon} size={16} />}
+              {models.state.status === "pending" ? null : (
+                <Icon icon={RefreshIcon} size={16} />
+              )}
             </Button>
             <Button
               disabled={disabled || !complete}
-              loading={test.isPending}
+              loading={test.state.status === "pending"}
               onClick={() => {
                 setToastShown(false);
-                test.mutate(
+                test.start(
                   { byok: input },
                   { onSettled: () => setToastShown(true) },
                 );
@@ -441,33 +567,35 @@ export function ByokPanel({
             >
               {t(m.byokTest)}
             </Button>
-            {toastShown && test.isSuccess ? (
+            {toastShown && test.state.status === "success" ? (
               <TestToast
                 onDismiss={() => setToastShown(false)}
                 title={t(m.byokConnected)}
                 tone="success"
               >
-                {test.data.model_id} ·{" "}
-                {byokContextLabel(test.data.context_window, t)} ·{" "}
-                {byokProtocolLabels[test.data.protocol]}
+                {test.state.data.model_id} ·{" "}
+                {byokContextLabel(test.state.data.context_window, t)} ·{" "}
+                {byokProtocolLabels[test.state.data.protocol]}
                 <br />
-                <Url>{test.data.url}</Url>
+                <Url>{test.state.data.url}</Url>
               </TestToast>
             ) : null}
-            {toastShown && test.isError ? (
+            {toastShown && test.state.status === "error" ? (
               <TestToast
                 onDismiss={() => setToastShown(false)}
                 title={t(m.byokCouldNotConnect)}
                 tone="danger"
               >
-                {failureCopy(test.error, t)}
+                {failureCopy(test.state.error, t)}
               </TestToast>
             ) : null}
           </div>
           <p
             className={cn(
               "mt-1.5 text-xs [overflow-wrap:anywhere]",
-              models.isError ? "text-destructive" : "text-muted-foreground",
+              models.state.status === "error"
+                ? "text-destructive"
+                : "text-muted-foreground",
             )}
             id={modelHintId}
           >

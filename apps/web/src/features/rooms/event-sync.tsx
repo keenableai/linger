@@ -16,6 +16,7 @@ import {
   localModelsQueryKey,
   tenantLocalModelsQueryKey,
 } from "@/features/local-models/local-models-queries";
+import { tenantModelSourceQueryKey } from "@/features/local-models/model-source-queries";
 import { teamHubDocumentsQueryKey } from "@/features/teamhub/document-queries";
 import type { TeamHubEventSignal } from "@/features/teamhub/event-transport";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
@@ -169,6 +170,7 @@ async function applyInvalidation(
         refreshActiveQueries(queryClient, [
           localComputersQueryKey(tenantId),
           tenantLocalModelsQueryKey(tenantId),
+          tenantModelSourceQueryKey(tenantId),
         ]),
       ]);
       return;

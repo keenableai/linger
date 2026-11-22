@@ -46,6 +46,8 @@ export function localModelsQueryOptions(
         }),
       ),
     queryKey: localModelsQueryKey(tenantId, computerId),
+    refetchOnMount: "always",
+    refetchOnWindowFocus: true,
     retry: false,
   });
 }
