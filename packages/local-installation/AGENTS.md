@@ -196,14 +196,23 @@ when `stack up` fails or the binding still needs repair (such as
 redacted human-readable messages with their `causeCode` in `details.causeCode`,
 and an unreviewable saved plan returns `LOCAL_MODELS_RECOVERY_REQUIRED` with
 `STACK_PLAN_INVALID`. `restoreLocalModels` (`local-models.ts`) brings back a
-local-models setup's stack while its services keep running, such as after
-the desktop's quit stopped it, only while that source is `local` or not
-saved yet: a ready stack costs one `setup binding` check, a stopped one gets
-the same restore (`stack up`, falling back to `stack apply`) and the local
-source set again. Deployments,
-that check and the quit-time stop share one lock per home
+local model source's stack and unloaded library model while its services keep
+running (and on cold resume when `model-source.json` says `local`), such as
+after the desktop's quit stopped them, whenever the active model source is
+`local` (or not saved yet on a `local-models` setup): a ready binding still
+checks `library status` so a quit-time `library unload` reloads the saved local
+model and re-applies the local source under the same lock, while a stopped plan
+gets the same restore (`stack up`, falling back to `stack apply`), verifies
+whether a saved `localmodels-library/` model is loaded, and sets the local
+source again. Library-model reload failures return a failure outcome that warm
+and cold resume surface in `details.localModelsDegraded` so startup stays usable
+and the person can still reach the Models page. On cold resume, a saved `local`
+source preserves local mode and prepares its runtime instead of letting an older
+`setup-choice.json` overwrite `model-source.json` back to `subscription`.
+Deployments, that check and the quit-time stop share one lock per home
 (`withLocalModelsLock`); the check waits up to 180 s for it, past the stop's
-150 s hard exit, then asks to try again.
+150 s hard exit, then reports `LOCAL_MODELS_RECOVERY_REQUIRED` (or
+`LOCAL_MODELS_BUSY` when restoring a library model without a stack plan).
 `restoreByokSource` (`local-models.ts`) brings back a saved BYOK source's
 Bifrost gateway on every resume (warm, or a restart from the saved choice,
 which then prepares the saved runtime and no other source). Under the same
