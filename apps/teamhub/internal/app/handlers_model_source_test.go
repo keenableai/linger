@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -10,7 +11,9 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/simplexai-labs/linger/apps/teamhub/internal/agentregistry"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/roomagent"
+	"github.com/simplexai-labs/linger/contracts-go/nodeservicesinternal"
 	httpapi "github.com/simplexai-labs/linger/contracts-go/teamhubpublic"
 )
 
@@ -70,6 +73,9 @@ func TestModelSourceRefusalCodesMapRoomErrors(t *testing.T) {
 			t.Fatalf("%s mapped to %q (ok=%v), want %q", computerCode, got, ok, httpapi.ModelSourceErrorCodeLocalModelNoRoom)
 		}
 	}
+	if got := modelSourceRefusalCodes["MODEL_SOURCE_EXPIRED"]; got != httpapi.ModelSourceErrorCodeModelSourceUnconfirmed {
+		t.Fatalf("MODEL_SOURCE_EXPIRED mapped to %q, want %q", got, httpapi.ModelSourceErrorCodeModelSourceUnconfirmed)
+	}
 	if modelSourceErrorMessages[httpapi.ModelSourceErrorCodeLocalModelNoRoom] == "" {
 		t.Fatal("LOCAL_MODEL_NO_ROOM has no message")
 	}
@@ -127,5 +133,207 @@ func TestWriteModelSourceFailureMapsByokGatewayFailedWithComputerDetail(t *testi
 		body.Error.Message != modelSourceErrorMessages[httpapi.ModelSourceErrorCodeModelSourceFailed] ||
 		body.Error.Details != nil {
 		t.Fatalf("unknown refusal: status=%d body=%+v", status, body)
+	}
+}
+
+type fakeModelSourceManagement struct {
+	apply func(context.Context, roomagent.ModelSourceTarget, nodeservicesinternal.ModelSourceApplyCommand) (nodeservicesinternal.ModelSourceStatus, error)
+}
+
+func (f fakeModelSourceManagement) LocalComputerModelSource(context.Context, roomagent.ModelSourceTarget) (nodeservicesinternal.ModelSourceStatus, error) {
+	return nodeservicesinternal.ModelSourceStatus{}, nil
+}
+
+func (f fakeModelSourceManagement) ApplyLocalComputerModelSource(ctx context.Context, target roomagent.ModelSourceTarget, command nodeservicesinternal.ModelSourceApplyCommand) (nodeservicesinternal.ModelSourceStatus, error) {
+	return f.apply(ctx, target, command)
+}
+
+func (f fakeModelSourceManagement) TestLocalComputerByok(context.Context, roomagent.ModelSourceTarget, nodeservicesinternal.ByokTestRequest) (nodeservicesinternal.ByokTestResult, error) {
+	return nodeservicesinternal.ByokTestResult{}, nil
+}
+
+func (f fakeModelSourceManagement) ListLocalComputerByokModels(context.Context, roomagent.ModelSourceTarget, nodeservicesinternal.ByokEndpointInput) (nodeservicesinternal.ByokModelList, error) {
+	return nodeservicesinternal.ByokModelList{}, nil
+}
+
+func TestExecuteModelSourceSwitchReconcilesAgentsEvenAfterClientDisconnect(t *testing.T) {
+	reqCtx, cancelReq := context.WithCancel(context.Background())
+	defer cancelReq()
+
+	a := &App{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	target := roomagent.ModelSourceTarget{TenantID: "tenant_1", OwnerActorID: "actor_owner", ComputerID: "computer_1"}
+	localModel := "localmodels-library/localmodels-lib-qwen3-8-27b/Qwen3.8-27B-UD-Q4_K_M"
+
+	var switched agentregistry.ComputerRuntimeSwitch
+	var switchedCtxErr error
+	management := fakeModelSourceManagement{
+		apply: func(ctx context.Context, _ roomagent.ModelSourceTarget, _ nodeservicesinternal.ModelSourceApplyCommand) (nodeservicesinternal.ModelSourceStatus, error) {
+			// Simulate the browser navigating away mid-switch.
+			cancelReq()
+			if err := ctx.Err(); err != nil {
+				t.Fatalf("apply context was canceled with client disconnect: %v", err)
+			}
+			return nodeservicesinternal.ModelSourceStatus{
+				Mode:         nodeservicesinternal.ModelSourceModeLocal,
+				Runtime:      nodeservicesinternal.ModelSourceRuntimePi,
+				RuntimeModel: localModel,
+			}, nil
+		},
+	}
+
+	public, result, invalid, err := a.executeModelSourceSwitch(
+		reqCtx,
+		management,
+		target,
+		nodeservicesinternal.ModelSourceApplyCommand{Mode: nodeservicesinternal.ModelSourceModeLocal},
+		httpapi.ModelSourceModeLocal,
+		false,
+		func(ctx context.Context, input agentregistry.ComputerRuntimeSwitch) (agentregistry.ComputerRuntimeSwitchResult, error) {
+			switchedCtxErr = ctx.Err()
+			switched = input
+			return agentregistry.ComputerRuntimeSwitchResult{UpdatedAgents: 3}, nil
+		},
+	)
+	if err != nil || invalid {
+		t.Fatalf("executeModelSourceSwitch failed: invalid=%v err=%v", invalid, err)
+	}
+	if switchedCtxErr != nil {
+		t.Fatalf("agent switch ran with canceled context: %v", switchedCtxErr)
+	}
+	if public.RuntimeModel != localModel || switched.RuntimeType != "pi" || switched.Model != localModel || result.UpdatedAgents != 3 {
+		t.Fatalf("unexpected reconciliation result: public=%+v switched=%+v result=%+v", public, switched, result)
+	}
+}
+
+func TestExecuteModelSourceSwitchRejectsInvalidModeModels(t *testing.T) {
+	a := &App{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	target := roomagent.ModelSourceTarget{TenantID: "tenant_1", OwnerActorID: "actor_owner", ComputerID: "computer_1"}
+
+	for _, tc := range []struct {
+		name        string
+		mode        httpapi.ModelSourceMode
+		cmdMode     nodeservicesinternal.ModelSourceMode
+		runtime     nodeservicesinternal.ModelSourceRuntime
+		returnModel string
+	}{
+		{
+			name:        "byok model on local switch",
+			mode:        httpapi.ModelSourceModeLocal,
+			cmdMode:     nodeservicesinternal.ModelSourceModeLocal,
+			runtime:     nodeservicesinternal.ModelSourceRuntimePi,
+			returnModel: "localmodels/localmodels-byok",
+		},
+		{
+			name:        "cloud model on local pi switch",
+			mode:        httpapi.ModelSourceModeLocal,
+			cmdMode:     nodeservicesinternal.ModelSourceModeLocal,
+			runtime:     nodeservicesinternal.ModelSourceRuntimePi,
+			returnModel: "anthropic/claude-fable-5",
+		},
+		{
+			name:        "pi-default on local pi switch",
+			mode:        httpapi.ModelSourceModeLocal,
+			cmdMode:     nodeservicesinternal.ModelSourceModeLocal,
+			runtime:     nodeservicesinternal.ModelSourceRuntimePi,
+			returnModel: "pi-default",
+		},
+		{
+			name:        "bare byok model on subscription switch",
+			mode:        httpapi.ModelSourceModeSubscription,
+			cmdMode:     nodeservicesinternal.ModelSourceModeSubscription,
+			runtime:     nodeservicesinternal.ModelSourceRuntimeClaude,
+			returnModel: "localmodels-byok",
+		},
+		{
+			name:        "prefixed byok model on subscription switch",
+			mode:        httpapi.ModelSourceModeSubscription,
+			cmdMode:     nodeservicesinternal.ModelSourceModeSubscription,
+			runtime:     nodeservicesinternal.ModelSourceRuntimeCodex,
+			returnModel: "localmodels/localmodels-byok",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			switched := false
+			management := fakeModelSourceManagement{
+				apply: func(context.Context, roomagent.ModelSourceTarget, nodeservicesinternal.ModelSourceApplyCommand) (nodeservicesinternal.ModelSourceStatus, error) {
+					return nodeservicesinternal.ModelSourceStatus{
+						Mode:         tc.cmdMode,
+						Runtime:      tc.runtime,
+						RuntimeModel: tc.returnModel,
+					}, nil
+				},
+			}
+			_, _, invalid, err := a.executeModelSourceSwitch(
+				context.Background(),
+				management,
+				target,
+				nodeservicesinternal.ModelSourceApplyCommand{Mode: tc.cmdMode},
+				tc.mode,
+				false,
+				func(context.Context, agentregistry.ComputerRuntimeSwitch) (agentregistry.ComputerRuntimeSwitchResult, error) {
+					switched = true
+					return agentregistry.ComputerRuntimeSwitchResult{}, nil
+				},
+			)
+			if err == nil || !invalid || switched {
+				t.Fatalf("expected invalid status rejection without switching agents; invalid=%v switched=%v err=%v", invalid, switched, err)
+			}
+		})
+	}
+}
+
+func TestWriteModelSourceFailureClassifiesTimeoutsCancelsAndRedactsAllowedMessages(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	a := &App{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	run := func(cancelReq bool, err error) (int, httpapi.ErrorResponse) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Set("request_id", "req_model_source_test")
+		reqCtx, cancel := context.WithCancel(context.Background())
+		if cancelReq {
+			cancel()
+		} else {
+			defer cancel()
+		}
+		c.Request = httptest.NewRequest(http.MethodPost, "/model-source", nil).WithContext(reqCtx)
+		a.writeModelSourceFailure(c, "computer_1", "models", err)
+		var body httpapi.ErrorResponse
+		if decErr := json.Unmarshal(w.Body.Bytes(), &body); decErr != nil {
+			t.Fatalf("decode response %q: %v", w.Body.String(), decErr)
+		}
+		return w.Code, body
+	}
+
+	if status, body := run(false, context.DeadlineExceeded); status != http.StatusGatewayTimeout || body.Error.Code != string(httpapi.ModelSourceErrorCodeModelSourceUnconfirmed) {
+		t.Fatalf("deadline exceeded -> %d %+v", status, body)
+	}
+	if status, body := run(true, context.Canceled); status != http.StatusGatewayTimeout || body.Error.Code != string(httpapi.ModelSourceErrorCodeModelSourceUnconfirmed) {
+		t.Fatalf("client cancel -> %d %+v", status, body)
+	}
+	if status, body := run(false, context.Canceled); status != http.StatusServiceUnavailable || body.Error.Code != string(httpapi.ModelSourceErrorCodeModelSourceServiceUnavailable) {
+		t.Fatalf("unexpected backend cancel -> %d %+v", status, body)
+	}
+	if status, body := run(false, &roomagent.ModelSourceError{Code: "MODEL_SOURCE_EXPIRED"}); status != http.StatusGatewayTimeout || body.Error.Code != string(httpapi.ModelSourceErrorCodeModelSourceUnconfirmed) {
+		t.Fatalf("MODEL_SOURCE_EXPIRED -> %d %+v", status, body)
+	}
+	status, body := run(false, &roomagent.ModelSourceError{
+		Code:    "BYOK_GATEWAY_FAILED",
+		Message: `Operation not permitted: '/bin/ps' reading '/home/alice/.local/share/localmodels/state.json', ~/secret.key, and C:\Users\alice\secret.key calling https://user:pass@api.example.com/v1/models?api_key=sk-1234567890abcdef123456 with Bearer tok_secret`,
+	})
+	if status != http.StatusBadGateway || body.Error.Code != string(httpapi.ModelSourceErrorCodeByokGatewayFailed) {
+		t.Fatalf("redacted BYOK_GATEWAY_FAILED -> %d %+v", status, body)
+	}
+	if body.Error.Details == nil || len(*body.Error.Details) != 1 || (*body.Error.Details)[0].Field != "gateway" || (*body.Error.Details)[0].Reason != body.Error.Message {
+		t.Fatalf("expected scrubbed gateway detail, got %+v", body.Error.Details)
+	}
+	for _, leaked := range []string{"/home/alice", "~/secret.key", `C:\Users\alice`, "user:pass", "sk-1234567890abcdef123456", "api_key=", "tok_secret"} {
+		if strings.Contains(body.Error.Message, leaked) {
+			t.Fatalf("BYOK_GATEWAY_FAILED leaked %q in %q", leaked, body.Error.Message)
+		}
+	}
+	if !strings.Contains(body.Error.Message, "'/bin/ps'") {
+		t.Fatalf("BYOK_GATEWAY_FAILED redacted benign binary path '/bin/ps' in %q", body.Error.Message)
 	}
 }

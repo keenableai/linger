@@ -80,6 +80,7 @@
         "LINGER_PI_PATH",
         "LINGER_PI_SESSION_ROOT",
         "LINGER_WEB_URL",
+        "LOCALMODELS_TOOLS_DIR",
         "TEAMHUB_AGENT_ID",
         "TEAMHUB_CONFIG",
         "TEAMHUB_PROFILE",

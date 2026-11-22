@@ -14,7 +14,6 @@ import (
 	"strings"
 
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/process"
-	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/workspace"
 )
 
 // HarnessRoot returns the shared runtime/harness directory sibling to a
@@ -81,27 +80,22 @@ func (t Tool) command(environment map[string]string, action Action) *exec.Cmd {
 // commandArgs builds one tool invocation the way the installer runs it: the
 // sealed kit on PYTHONPATH and as the working directory, no user site
 // packages, no bytecode writes into the sealed kit, and PI_CODING_AGENT_DIR
-// resolved through OverlayEnvironment and workspace.PiSourceEnvironment so
-// localmodels reads and writes the same Pi profile the Daemon probes and runs.
+// set only to an existing managed gateway-home Pi profile (otherwise omitted
+// so localmodels defaults to tools/gateway-home/.pi/agent without inheriting
+// a stale BYOK profile or writing into personal ~/.pi/agent).
 func (t Tool) commandArgs(environment map[string]string, args []string) *exec.Cmd {
 	cmd := exec.Command(t.Python, args...)
 	cmd.Dir = t.ModuleDirectory
-	cleaned := make(map[string]string, len(environment))
+	effective := make(map[string]string, len(environment)+5)
 	for key, value := range environment {
 		switch strings.ToUpper(key) {
-		case "PYTHONHOME", "PYTHONSTARTUP", "PYTHONINSPECT", "PYTHONPATH", "LOCALMODELS_STATE":
-			continue
-		case "PI_CODING_AGENT_DIR":
-			if trimmed := strings.TrimSpace(value); trimmed != "" {
-				cleaned["PI_CODING_AGENT_DIR"] = trimmed
-			}
+		case "PYTHONHOME", "PYTHONSTARTUP", "PYTHONINSPECT", "PYTHONPATH", "LOCALMODELS_STATE", "PI_CODING_AGENT_DIR":
 			continue
 		}
-		cleaned[key] = value
+		effective[key] = value
 	}
-	effective := OverlayEnvironment(cleaned, t.StateDirectory)
-	if piEnv, err := workspace.PiSourceEnvironment(effective); err == nil && piEnv["PI_CODING_AGENT_DIR"] != "" {
-		effective["PI_CODING_AGENT_DIR"] = piEnv["PI_CODING_AGENT_DIR"]
+	if piProfile := localGatewayPiProfile(environment, t.StateDirectory); piProfile != "" {
+		effective["PI_CODING_AGENT_DIR"] = piProfile
 	}
 	effective["PYTHONPATH"] = t.ModuleDirectory
 	effective["LOCALMODELS_STATE"] = t.StateDirectory

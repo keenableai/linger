@@ -16,51 +16,68 @@ func TestToolCommandAlignsPiCodingAgentDir(t *testing.T) {
 	fake := newFakeTool(t)
 	home := filepath.Join(filepath.Dir(fake.state), "home")
 	explicit := filepath.Join(filepath.Dir(fake.state), "custom-pi")
-
-	cmdDefault := fake.tool.command(map[string]string{"HOME": home, "PI_CODING_AGENT_DIR": ""}, Action{Name: ActionRefresh})
-	wantDefault := "PI_CODING_AGENT_DIR=" + filepath.Join(home, ".pi", "agent")
-	if !slices.Contains(cmdDefault.Env, wantDefault) {
-		t.Fatalf("expected %q in env %v", wantDefault, cmdDefault.Env)
+	byokPi := filepath.Join(fake.tool.StateDirectory, "byok-home", ".pi", "agent")
+	if err := os.MkdirAll(filepath.Join(home, ".pi", "agent"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(byokPi, 0o700); err != nil {
+		t.Fatal(err)
 	}
 
-	cmdExplicit := fake.tool.command(map[string]string{"HOME": home, "pi_coding_agent_dir": explicit}, Action{Name: ActionRefresh})
-	wantExplicit := "PI_CODING_AGENT_DIR=" + explicit
-	if !slices.Contains(cmdExplicit.Env, wantExplicit) {
-		t.Fatalf("expected %q in env %v", wantExplicit, cmdExplicit.Env)
+	hasPiDir := func(env []string) (string, bool) {
+		for _, entry := range env {
+			if strings.HasPrefix(entry, "PI_CODING_AGENT_DIR=") {
+				return strings.TrimPrefix(entry, "PI_CODING_AGENT_DIR="), true
+			}
+		}
+		return "", false
 	}
 
+	// Without a managed gateway-home Pi dir, tool invocations omit
+	// PI_CODING_AGENT_DIR rather than pointing localmodels at ~/.pi/agent,
+	// a custom user dir, or a stale byok-home profile.
+	for _, tc := range []struct {
+		name string
+		env  map[string]string
+	}{
+		{name: "blank default", env: map[string]string{"HOME": home, "PI_CODING_AGENT_DIR": ""}},
+		{name: "custom dir", env: map[string]string{"HOME": home, "pi_coding_agent_dir": explicit}},
+		{name: "stale byok dir", env: map[string]string{"HOME": home, "PI_CODING_AGENT_DIR": byokPi}},
+	} {
+		cmd := fake.tool.command(tc.env, Action{Name: ActionRefresh})
+		if val, ok := hasPiDir(cmd.Env); ok {
+			t.Fatalf("%s: expected PI_CODING_AGENT_DIR omitted when no gateway-home exists, got %q", tc.name, val)
+		}
+	}
+
+	// Even when model-source.json is currently BYOK with byok-home/.pi/agent,
+	// tool commands must not pass byok-home back into localmodels.
+	writeModelSourceJSON(t, fake.tool.StateDirectory, map[string]any{
+		"schema":      modelSourceSchema,
+		"mode":        "byok",
+		"runtime":     "pi",
+		"environment": map[string]string{"PI_CODING_AGENT_DIR": byokPi},
+	})
+	if val, ok := hasPiDir(fake.tool.command(map[string]string{"HOME": home}, Action{Name: ActionRefresh}).Env); ok {
+		t.Fatalf("expected byok-home omitted before gateway-home exists, got %q", val)
+	}
+
+	// Once a managed gateway-home Pi profile exists, tool commands pass it
+	// consistently regardless of any base env override or previous mode.
 	gatewayPi := filepath.Join(fake.tool.StateDirectory, "gateway-home", ".pi", "agent")
 	if err := os.MkdirAll(gatewayPi, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	writeModelSourceJSON(t, fake.tool.StateDirectory, map[string]any{
-		"schema":  modelSourceSchema,
-		"mode":    "local",
-		"runtime": "pi",
-	})
-	cmdOverlay := fake.tool.command(map[string]string{"HOME": home}, Action{Name: ActionRefresh})
 	wantOverlay := "PI_CODING_AGENT_DIR=" + gatewayPi
-	if !slices.Contains(cmdOverlay.Env, wantOverlay) {
-		t.Fatalf("expected local overlay %q in env %v", wantOverlay, cmdOverlay.Env)
-	}
-
-	// Local model-source overlay beats an explicit PI_CODING_AGENT_DIR in the
-	// base environment, matching OverlayEnvironment.
-	cmdExplicitAndOverlay := fake.tool.command(map[string]string{"HOME": home, "PI_CODING_AGENT_DIR": explicit}, Action{Name: ActionRefresh})
-	if !slices.Contains(cmdExplicitAndOverlay.Env, wantOverlay) {
-		t.Fatalf("expected local overlay %q to override explicit base env %v", wantOverlay, cmdExplicitAndOverlay.Env)
-	}
-
-	// Switching away from local strips a managed gateway-home Pi dir and falls
-	// back to the source Pi profile (~/.pi/agent).
-	writeModelSourceJSON(t, fake.tool.StateDirectory, map[string]any{
-		"schema":  modelSourceSchema,
-		"mode":    "subscription",
-		"runtime": "claude",
-	})
-	cmdSubscription := fake.tool.command(map[string]string{"HOME": home, "PI_CODING_AGENT_DIR": gatewayPi}, Action{Name: ActionRefresh})
-	if !slices.Contains(cmdSubscription.Env, wantDefault) {
-		t.Fatalf("expected stale gateway path stripped back to %q in %v", wantDefault, cmdSubscription.Env)
+	for _, env := range []map[string]string{
+		{"HOME": home},
+		{"HOME": home, "PI_CODING_AGENT_DIR": explicit},
+		{"HOME": home, "PI_CODING_AGENT_DIR": byokPi},
+	} {
+		cmd := fake.tool.command(env, Action{Name: ActionRefresh})
+		if !slices.Contains(cmd.Env, wantOverlay) {
+			t.Fatalf("expected managed gateway-home %q in env %v", wantOverlay, cmd.Env)
+		}
 	}
 }
 
@@ -126,9 +143,15 @@ func TestLoadProvisionsPiInHarnessDirectoryWithNodePathAndNotifiesRuntimeChanged
 		!slices.ContainsFunc(calls, func(c string) bool { return strings.HasPrefix(c, "harness apply ") }) {
 		t.Fatalf("expected harness status/plan(--node)/apply in calls: %v", calls)
 	}
-	wantPiDir := "PI_CODING_AGENT_DIR=" + filepath.Join(home, ".pi", "agent")
-	if !slices.ContainsFunc(calls, func(c string) bool { return strings.HasPrefix(c, "load ") && strings.Contains(c, wantPiDir) }) {
-		t.Fatalf("expected load call with %s in %v", wantPiDir, calls)
+	if slices.ContainsFunc(calls, func(c string) bool {
+		return strings.HasPrefix(c, "load ") && strings.Contains(c, filepath.Join(home, ".pi", "agent"))
+	}) {
+		t.Fatalf("load call unexpectedly injected personal ~/.pi/agent in %v", calls)
+	}
+	if !slices.ContainsFunc(calls, func(c string) bool {
+		return strings.HasPrefix(c, "load ") && strings.HasSuffix(c, "|PI_CODING_AGENT_DIR=")
+	}) {
+		t.Fatalf("expected load call without managed gateway-home to omit PI_CODING_AGENT_DIR in %v", calls)
 	}
 }
 

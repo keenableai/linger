@@ -6,15 +6,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
+	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/provider/redact"
 	localworkspace "github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/workspace"
 	wire "github.com/simplexai-labs/linger/contracts-go/runnergateway"
 )
@@ -25,8 +29,17 @@ const (
 	modelSourceCheckSchema  = "localmodels.byok-check/v1"
 	modelSourceModelsSchema = "localmodels.byok-models/v1"
 
-	defaultModelSourceTimeout = 3 * time.Minute
-	defaultByokTestTimeout    = 45 * time.Second
+	// Leave headroom inside the Runner Gateway's 180s apply budget so the
+	// Computer returns a structured MODEL_SOURCE_TIMEOUT before the gateway aborts.
+	defaultModelSourceTimeout = 165 * time.Second
+	// Leave headroom inside the Runner Gateway's 45s status/probe budget so the
+	// Computer returns a structured timeout before the gateway aborts.
+	defaultModelSourceStatusTimeout = 40 * time.Second
+	defaultByokTestTimeout          = 40 * time.Second
+	// Reserve time inside Apply's total budget for synchronous post-apply
+	// Runtime discovery while bounding it when Apply finishes quickly.
+	defaultOnAppliedReserve = 25 * time.Second
+	defaultOnAppliedMax     = 30 * time.Second
 )
 
 // ModelSourceError carries a structured error code and message from localmodels
@@ -119,18 +132,90 @@ func ReadOverlay(stateDir string) *OverlayState {
 	}
 }
 
-func isManagedGatewayProfilePath(stateDir, candidate string) bool {
-	if stateDir == "" || candidate == "" {
-		return false
-	}
-	cleaned := filepath.Clean(candidate)
-	for _, sub := range []string{"gateway-home", "byok-home"} {
-		prefix := filepath.Clean(filepath.Join(stateDir, sub))
-		if cleaned == prefix || strings.HasPrefix(cleaned, prefix+string(filepath.Separator)) {
+func hasManagedProfileSuffix(cleaned string, homes ...string) bool {
+	parts := strings.Split(filepath.ToSlash(cleaned), "/")
+	for i := 0; i < len(parts); i++ {
+		if parts[i] != "localmodels" {
+			continue
+		}
+		if i+1 < len(parts) && slices.Contains(homes, parts[i+1]) {
+			return true
+		}
+		if i+2 < len(parts) && parts[i+1] == "tools" && slices.Contains(homes, parts[i+2]) {
 			return true
 		}
 	}
 	return false
+}
+
+func isManagedProfilePath(stateDir, candidate string, homes ...string) bool {
+	if candidate == "" {
+		return false
+	}
+	cleaned := filepath.Clean(candidate)
+	if stateDir != "" {
+		for _, sub := range homes {
+			prefix := filepath.Clean(filepath.Join(stateDir, sub))
+			if cleaned == prefix || strings.HasPrefix(cleaned, prefix+string(filepath.Separator)) {
+				return true
+			}
+		}
+	}
+	return hasManagedProfileSuffix(cleaned, homes...)
+}
+
+func envLookup(base map[string]string, key string) string {
+	if value, ok := base[key]; ok {
+		return strings.TrimSpace(value)
+	}
+	for k, value := range base {
+		if strings.EqualFold(k, key) {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func isManagedProfileInEnv(base map[string]string, stateDir, candidate string, homes ...string) bool {
+	if candidate == "" {
+		return false
+	}
+	cleaned := filepath.Clean(candidate)
+	if toolsDir := envLookup(base, "LOCALMODELS_TOOLS_DIR"); toolsDir != "" && filepath.IsAbs(toolsDir) {
+		for _, sub := range homes {
+			prefix := filepath.Clean(filepath.Join(toolsDir, sub))
+			if cleaned == prefix || strings.HasPrefix(cleaned, prefix+string(filepath.Separator)) {
+				return true
+			}
+		}
+	}
+	return isManagedProfilePath(stateDir, cleaned, homes...)
+}
+
+func localGatewayPiProfile(base map[string]string, stateDir string) string {
+	candidates := make([]string, 0, 4)
+	if toolsDir := envLookup(base, "LOCALMODELS_TOOLS_DIR"); toolsDir != "" && filepath.IsAbs(toolsDir) {
+		candidates = append(candidates, filepath.Join(filepath.Clean(toolsDir), "gateway-home", ".pi", "agent"))
+	}
+	if stateDir != "" {
+		candidates = append(candidates, filepath.Join(stateDir, "gateway-home", ".pi", "agent"))
+	}
+	if existing := envLookup(base, "PI_CODING_AGENT_DIR"); isManagedProfileInEnv(base, stateDir, existing, "gateway-home") {
+		candidates = append(candidates, filepath.Clean(existing))
+	}
+	home := envLookup(base, "HOME")
+	if home == "" {
+		home = envLookup(base, "USERPROFILE")
+	}
+	if home != "" {
+		candidates = append(candidates, filepath.Join(home, ".local", "share", "localmodels", "tools", "gateway-home", ".pi", "agent"))
+	}
+	for _, candidate := range candidates {
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			return candidate
+		}
+	}
+	return ""
 }
 
 // runtimeProfileKeys names the environment variable that selects each
@@ -142,8 +227,11 @@ var runtimeProfileKeys = map[string]string{"codex": "CODEX_HOME", "claude": "CLA
 // BYOK endpoint, rather than its own provider: its profile is one localmodels
 // manages. Such models have no provider-hosted web search.
 func GatewayRuntime(environment map[string]string, stateDir, runtimeType string) bool {
+	if stateDir == "" {
+		return false
+	}
 	key, ok := runtimeProfileKeys[runtimeType]
-	return ok && isManagedGatewayProfilePath(stateDir, environment[key])
+	return ok && isManagedProfileInEnv(environment, stateDir, environment[key], "gateway-home", "byok-home")
 }
 
 // OverlayEnvironment computes the effective Runtime discovery/execution
@@ -159,7 +247,7 @@ func OverlayEnvironment(base map[string]string, stateDir string) map[string]stri
 		return result
 	}
 	for _, key := range allowedOverlayEnvKeys {
-		if isManagedGatewayProfilePath(stateDir, result[key]) {
+		if isManagedProfileInEnv(base, stateDir, result[key], "gateway-home", "byok-home") {
 			delete(result, key)
 		}
 	}
@@ -175,14 +263,18 @@ func OverlayEnvironment(base map[string]string, stateDir string) map[string]stri
 			}
 		}
 		for key, value := range overlay.Environment {
+			if overlay.Mode == "local" && key == "PI_CODING_AGENT_DIR" && isManagedProfileInEnv(base, stateDir, value, "byok-home") {
+				continue
+			}
 			result[key] = value
 		}
-		return result
 	}
-	if overlay.Mode == "local" && stateDir != "" {
-		piProfile := filepath.Join(stateDir, "gateway-home", ".pi", "agent")
-		if info, err := os.Stat(piProfile); err == nil && info.IsDir() {
-			result["PI_CODING_AGENT_DIR"] = piProfile
+	if overlay.Mode == "local" {
+		overlayPi, hasOverlayPi := overlay.Environment["PI_CODING_AGENT_DIR"]
+		if !hasOverlayPi || isManagedProfileInEnv(base, stateDir, overlayPi, "byok-home") {
+			if piProfile := localGatewayPiProfile(base, stateDir); piProfile != "" {
+				result["PI_CODING_AGENT_DIR"] = piProfile
+			}
 		}
 	}
 	return result
@@ -275,7 +367,7 @@ func NewModelSource(options ModelSourceOptions) *ModelSource {
 	}
 	statusTimeout := options.StatusTimeout
 	if statusTimeout <= 0 {
-		statusTimeout = defaultStatusTimeout
+		statusTimeout = defaultModelSourceStatusTimeout
 	}
 	testTimeout := options.TestTimeout
 	if testTimeout <= 0 {
@@ -357,6 +449,13 @@ func (m *ModelSource) Status(ctx context.Context) (wire.ModelSourceStatus, error
 	}
 	stdout, exitCode, err := m.runTool(runCtx, "source_status", args, nil)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			return wire.ModelSourceStatus{}, &ModelSourceError{
+				Code:      "MODEL_SOURCE_TIMEOUT",
+				Message:   "Timed out reading model source status on this Computer.",
+				Retryable: true,
+			}
+		}
 		return wire.ModelSourceStatus{}, &ModelSourceError{
 			Code:      CodeToolFailed,
 			Message:   "Could not read model source status on this Computer.",
@@ -424,22 +523,30 @@ func (m *ModelSource) runEndpointCommand(ctx context.Context, input wire.ByokCon
 	args := append([]string{"-P", "-s", "-m", "localmodels", "source", verb, "--config-stdin", "--json"}, flags...)
 	stdout, exitCode, runErr := m.runTool(runCtx, "source_"+verb, args, stdin)
 	if runErr != nil {
+		if errors.Is(runErr, context.DeadlineExceeded) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			return &ModelSourceError{
+				Code:      "BYOK_CHECK_TIMEOUT",
+				Message:   "Timed out while reaching the BYOK endpoint.",
+				Retryable: true,
+			}
+		}
 		return &ModelSourceError{
-			Code:      "BYOK_CHECK_TIMEOUT",
-			Message:   "Timed out while reaching the BYOK endpoint.",
+			Code:      CodeToolFailed,
+			Message:   "Could not run the BYOK endpoint check on this Computer.",
 			Retryable: true,
 		}
 	}
 	if unsupported := unsupportedSourceCommand(exitCode, stdout); unsupported != nil {
 		return unsupported
 	}
+	doc := lastJSONDocument(stdout)
 	var outcome struct {
 		Schema  string `json:"schema"`
 		OK      bool   `json:"ok"`
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	}
-	if json.Unmarshal(stdout, &outcome) != nil || (outcome.OK && json.Unmarshal(stdout, result) != nil) {
+	if len(doc) == 0 || json.Unmarshal(doc, &outcome) != nil || (outcome.OK && json.Unmarshal(doc, result) != nil) {
 		return &ModelSourceError{
 			Code:      CodeToolFailed,
 			Message:   "The BYOK endpoint check returned an unreadable response.",
@@ -451,13 +558,9 @@ func (m *ModelSource) runEndpointCommand(ctx context.Context, input wire.ByokCon
 		if code == "" {
 			code = "BYOK_CHECK_FAILED"
 		}
-		msg := strings.TrimSpace(outcome.Message)
-		if msg == "" {
-			msg = "Could not reach the BYOK endpoint."
-		}
 		return &ModelSourceError{
 			Code:      code,
-			Message:   clip(redactSecret(msg, input.APIKey), 500),
+			Message:   sanitizeModelSourceMessage(outcome.Message, "Could not reach the BYOK endpoint.", input.APIKey),
 			Retryable: code == "BYOK_UNREACHABLE",
 		}
 	}
@@ -502,12 +605,20 @@ func (m *ModelSource) Apply(ctx context.Context, apply ModelSourceApply) (wire.M
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	runCtx, cancel := context.WithTimeout(ctx, m.applyTimeout)
+	applyDeadline := time.Now().Add(m.applyTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(applyDeadline) {
+		applyDeadline = ctxDeadline
+	}
+	toolDeadline := applyDeadline
+	if m.onApplied != nil && time.Until(applyDeadline) > 2*defaultOnAppliedReserve {
+		toolDeadline = applyDeadline.Add(-defaultOnAppliedReserve)
+	}
+	runCtx, cancel := context.WithDeadline(ctx, toolDeadline)
 	defer cancel()
 	args := m.applyArgs(apply.Mode, apply.Runtime, apply.LocalModelID, len(stdin) > 0)
 	stdout, exitCode, runErr := m.runTool(runCtx, "source_apply", args, stdin)
 	if runErr != nil {
-		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+		if errors.Is(runErr, context.DeadlineExceeded) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 			return wire.ModelSourceStatus{}, &ModelSourceError{
 				Code:      "MODEL_SOURCE_TIMEOUT",
 				Message:   "Model source switch timed out on this Computer.",
@@ -516,7 +627,7 @@ func (m *ModelSource) Apply(ctx context.Context, apply ModelSourceApply) (wire.M
 		}
 		return wire.ModelSourceStatus{}, &ModelSourceError{
 			Code:      CodeToolFailed,
-			Message:   "Model source switch could not run on this Computer.",
+			Message:   "Could not run the model source switch on this Computer.",
 			Retryable: true,
 		}
 	}
@@ -539,9 +650,16 @@ func (m *ModelSource) Apply(ctx context.Context, apply ModelSourceApply) (wire.M
 	m.persistRuntimePaths(stdout)
 	var catalogs map[string][]RuntimeModelOption
 	if m.onApplied != nil {
-		catalogs = m.onApplied(runCtx)
+		if remaining := time.Until(applyDeadline); remaining > 0 {
+			// source apply already mutated model-source.json on disk; run Runtime
+			// discovery within the remaining Apply budget without inheriting cancel.
+			refreshBudget := min(m.statusTimeout, defaultOnAppliedMax, remaining)
+			refreshCtx, refreshCancel := context.WithTimeout(context.WithoutCancel(ctx), refreshBudget)
+			catalogs = m.onApplied(refreshCtx)
+			refreshCancel()
+		}
 	}
-	status.RuntimeModel, status.ReasoningEffort = agentRuntimeModel(status.Runtime, status.RuntimeModel, catalogs[status.Runtime])
+	status.RuntimeModel, status.ReasoningEffort = agentRuntimeModel(status.Mode, status.Runtime, status.RuntimeModel, catalogs[status.Runtime])
 	return status, nil
 }
 
@@ -572,24 +690,81 @@ func (m *ModelSource) applyArgs(mode, runtime, localModelID string, configStdin 
 	return args
 }
 
+func isByokRuntimeModel(id string) bool {
+	return id == "localmodels-byok" || strings.HasSuffix(id, "/localmodels-byok")
+}
+
+func isLocalRuntimeModel(id string) bool {
+	return !isByokRuntimeModel(id) &&
+		(strings.HasPrefix(id, "localmodels/") || strings.HasPrefix(id, "localmodels-library/"))
+}
+
 // agentRuntimeModel picks the model the Computer's Agents run after a switch:
-// the target model when the Runtime's catalog offers it, else the catalog's
-// default, else its first entry. A Runtime without a catalog runs the target
-// model, or its host default under the id Agent Service and TeamHub use for
-// it. The effort is the model's default, else its first allowed one, because
-// a model that offers efforts needs one.
-func agentRuntimeModel(runtime, target string, catalog []RuntimeModelOption) (string, string) {
-	if len(catalog) == 0 {
+// the target model when the Runtime's catalog offers it, else a mode-compatible
+// default or catalog entry. In local mode only localmodels/ and
+// localmodels-library/ models are eligible; if none exist, an empty model ID is
+// returned so TeamHub refuses rather than routing Agents to a cloud model. In
+// subscription mode stale localmodels-byok entries are excluded. A non-local
+// Runtime without a catalog runs the target model, or its host default under
+// the id Agent Service and TeamHub use for it. The effort is the model's
+// default, else its first allowed one, because a model that offers efforts
+// needs one.
+func agentRuntimeModel(mode, runtime, target string, catalog []RuntimeModelOption) (string, string) {
+	if mode == "local" {
+		if !isLocalRuntimeModel(target) {
+			target = ""
+		}
+		localCandidates := make([]RuntimeModelOption, 0, len(catalog))
+		for _, model := range catalog {
+			if isLocalRuntimeModel(model.ID) {
+				localCandidates = append(localCandidates, model)
+			}
+		}
+		if len(localCandidates) == 0 {
+			if target != "" {
+				return target, ""
+			}
+			return "", ""
+		}
+		index := slices.IndexFunc(localCandidates, func(model RuntimeModelOption) bool { return target != "" && model.ID == target })
+		if index < 0 {
+			index = slices.IndexFunc(localCandidates, func(model RuntimeModelOption) bool { return model.IsDefault })
+		}
+		if index < 0 {
+			index = 0
+		}
+		model := localCandidates[index]
+		effort := model.DefaultReasoningEffort
+		if effort == "" && len(model.AllowedReasoningEffort) > 0 {
+			effort = model.AllowedReasoningEffort[0]
+		}
+		return model.ID, effort
+	}
+	avoidByok := mode == "subscription"
+	if avoidByok && isByokRuntimeModel(target) {
+		target = ""
+	}
+	candidates := catalog
+	if avoidByok && len(catalog) > 0 {
+		filtered := make([]RuntimeModelOption, 0, len(catalog))
+		for _, model := range catalog {
+			if !isByokRuntimeModel(model.ID) {
+				filtered = append(filtered, model)
+			}
+		}
+		candidates = filtered
+	}
+	if len(candidates) == 0 {
 		if target != "" {
 			return target, ""
 		}
 		return runtime + "-default", ""
 	}
-	index := slices.IndexFunc(catalog, func(model RuntimeModelOption) bool { return target != "" && model.ID == target })
+	index := slices.IndexFunc(candidates, func(model RuntimeModelOption) bool { return target != "" && model.ID == target })
 	if index < 0 {
-		index = max(0, slices.IndexFunc(catalog, func(model RuntimeModelOption) bool { return model.IsDefault }))
+		index = max(0, slices.IndexFunc(candidates, func(model RuntimeModelOption) bool { return model.IsDefault }))
 	}
-	model := catalog[index]
+	model := candidates[index]
 	effort := model.DefaultReasoningEffort
 	if effort == "" && len(model.AllowedReasoningEffort) > 0 {
 		effort = model.AllowedReasoningEffort[0]
@@ -601,8 +776,9 @@ func (m *ModelSource) persistRuntimePaths(stdout []byte) {
 	if m.tool == nil || m.tool.StateDirectory == "" {
 		return
 	}
+	docBytes := lastJSONDocument(stdout)
 	var doc sourceStatusDocument
-	if err := json.Unmarshal(stdout, &doc); err != nil || len(doc.RuntimePaths) == 0 {
+	if len(docBytes) == 0 || json.Unmarshal(docBytes, &doc) != nil || len(doc.RuntimePaths) == 0 {
 		return
 	}
 	stateFile := filepath.Join(m.tool.StateDirectory, "model-source.json")
@@ -644,9 +820,56 @@ func (m *ModelSource) resolveNodePath() string {
 	return ""
 }
 
+// lastJSONDocument extracts the final JSON object from stdout, tolerating
+// preceding JSONL progress events, pretty-printed multi-line JSON objects, and
+// non-JSON prefix lines emitted by localmodels before the terminal document.
+func lastJSONDocument(stdout []byte) []byte {
+	trimmed := bytes.TrimSpace(stdout)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	var last []byte
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	for {
+		var raw json.RawMessage
+		err := dec.Decode(&raw)
+		if err == nil {
+			candidate := bytes.TrimSpace(raw)
+			if len(candidate) > 0 && candidate[0] == '{' {
+				last = candidate
+			}
+			continue
+		}
+		if errors.Is(err, io.EOF) {
+			return last
+		}
+		offset := int(dec.InputOffset())
+		if offset >= len(trimmed) {
+			return last
+		}
+		next := bytes.IndexByte(trimmed[offset:], '{')
+		if next < 0 {
+			return last
+		}
+		if next == 0 {
+			offset++
+			if offset >= len(trimmed) {
+				return last
+			}
+			next = bytes.IndexByte(trimmed[offset:], '{')
+			if next < 0 {
+				return last
+			}
+		}
+		trimmed = trimmed[offset+next:]
+		dec = json.NewDecoder(bytes.NewReader(trimmed))
+	}
+}
+
 func parseSourceStatus(stdout []byte) (wire.ModelSourceStatus, error) {
+	docBytes := lastJSONDocument(stdout)
 	var doc sourceStatusDocument
-	if err := json.Unmarshal(stdout, &doc); err != nil || doc.Schema != modelSourceStatusSchema {
+	if len(docBytes) == 0 || json.Unmarshal(docBytes, &doc) != nil || doc.Schema != modelSourceStatusSchema {
 		return wire.ModelSourceStatus{}, &ModelSourceError{
 			Code:      CodeToolFailed,
 			Message:   "Model source status output did not match its contract.",
@@ -687,13 +910,63 @@ func unsupportedSourceCommand(exitCode int, stdout []byte) error {
 	return nil
 }
 
+var (
+	modelSourceURLQueryPattern         = regexp.MustCompile(`(?i)(\b[a-z][a-z0-9+.-]*://[^\s?#"'\)\]}]+)\?[^\s"'<>)\]}]*`)
+	modelSourceShortTokenPattern       = regexp.MustCompile(`\b(?:(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}|(?:gh[pousr]|glpat)[-_][A-Za-z0-9_-]{16,})\b`)
+	modelSourceWinHomeSingleQuotedPath = regexp.MustCompile(`(?i)'(?:\\\\\?\\)?[A-Z]:(?:\\|/)Users(?:\\|/)[^']*'`)
+	modelSourceWinHomeDoubleQuotedPath = regexp.MustCompile(`(?i)"(?:\\\\\?\\)?[A-Z]:(?:\\|/)Users(?:\\|/)[^"]*"`)
+	modelSourceWinHomePathPattern      = regexp.MustCompile(`(?i)(^|[\s"'(\[=,:])(?:\\\\\?\\)?[A-Z]:(?:\\|/)Users(?:\\|/)[^\s"'<>)\]}]+`)
+	modelSourceUnixHomeSingleQuoted    = regexp.MustCompile(`'/(?:home|Users|root)/[^']*'`)
+	modelSourceUnixHomeDoubleQuoted    = regexp.MustCompile(`"/(?:home|Users|root)/[^"]*"`)
+	modelSourceUnixHomePathPattern     = regexp.MustCompile(`(^|[\s"'(\[=,:])/(?:home|Users|root)/[^\s"'<>)\]}]+`)
+	modelSourceHomeRelSingleQuoted     = regexp.MustCompile(`'~[/\\][^']*'`)
+	modelSourceHomeRelDoubleQuoted     = regexp.MustCompile(`"~[/\\][^"]*"`)
+	modelSourceHomeRelPathPattern      = regexp.MustCompile(`(^|[\s"'(\[=,:])~[/\\][^\s"'<>)\]}]+`)
+)
+
+// sanitizeModelSourceMessage removes secrets, URL query strings/userinfo, and
+// user-home paths while preserving benign system binary paths such as /bin/ps
+// needed for gateway diagnostics.
+func sanitizeModelSourceMessage(raw, fallback, secret string) string {
+	scrubbed := strings.TrimSpace(raw)
+	if scrubbed == "" {
+		return fallback
+	}
+	scrubbed = redactSecret(scrubbed, secret)
+	scrubbed = modelSourceURLQueryPattern.ReplaceAllString(scrubbed, "${1}?[REDACTED]")
+	scrubbed = redact.Text(scrubbed)
+	scrubbed = modelSourceShortTokenPattern.ReplaceAllString(scrubbed, "[REDACTED]")
+	scrubbed = modelSourceWinHomeSingleQuotedPath.ReplaceAllString(scrubbed, "'[REDACTED PATH]'")
+	scrubbed = modelSourceWinHomeDoubleQuotedPath.ReplaceAllString(scrubbed, `"[REDACTED PATH]"`)
+	scrubbed = modelSourceWinHomePathPattern.ReplaceAllString(scrubbed, "${1}[REDACTED PATH]")
+	scrubbed = modelSourceUnixHomeSingleQuoted.ReplaceAllString(scrubbed, "'[REDACTED PATH]'")
+	scrubbed = modelSourceUnixHomeDoubleQuoted.ReplaceAllString(scrubbed, `"[REDACTED PATH]"`)
+	scrubbed = modelSourceUnixHomePathPattern.ReplaceAllString(scrubbed, "${1}[REDACTED PATH]")
+	scrubbed = modelSourceHomeRelSingleQuoted.ReplaceAllString(scrubbed, "'[REDACTED PATH]'")
+	scrubbed = modelSourceHomeRelDoubleQuoted.ReplaceAllString(scrubbed, `"[REDACTED PATH]"`)
+	scrubbed = modelSourceHomeRelPathPattern.ReplaceAllString(scrubbed, "${1}[REDACTED PATH]")
+	scrubbed = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' {
+			return -1
+		}
+		return r
+	}, scrubbed)
+	cleaned := strings.Join(strings.Fields(scrubbed), " ")
+	if cleaned == "" {
+		return fallback
+	}
+	return clip(cleaned, 500)
+}
+
 func parseToolFailure(stdout []byte, fallbackCode, fallbackMessage, secret string) error {
+	docBytes := lastJSONDocument(stdout)
 	var errDoc struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 		Detail  string `json:"detail"`
+		Error   string `json:"error"`
 	}
-	if err := json.Unmarshal(stdout, &errDoc); err == nil {
+	if len(docBytes) > 0 && json.Unmarshal(docBytes, &errDoc) == nil {
 		code := strings.TrimSpace(errDoc.Code)
 		if code == "" {
 			code = fallbackCode
@@ -703,12 +976,12 @@ func parseToolFailure(stdout []byte, fallbackCode, fallbackMessage, secret strin
 			msg = strings.TrimSpace(errDoc.Detail)
 		}
 		if msg == "" {
-			msg = fallbackMessage
+			msg = strings.TrimSpace(errDoc.Error)
 		}
 		return &ModelSourceError{
 			Code:      code,
-			Message:   clip(redactSecret(msg, secret), 500),
-			Retryable: code == "BYOK_UNREACHABLE" || code == "NETWORK_UNAVAILABLE",
+			Message:   sanitizeModelSourceMessage(msg, fallbackMessage, secret),
+			Retryable: code == "BYOK_UNREACHABLE" || code == "NETWORK_UNAVAILABLE" || code == "MODEL_SOURCE_TIMEOUT" || code == "BYOK_CHECK_TIMEOUT",
 		}
 	}
 	return &ModelSourceError{Code: fallbackCode, Message: fallbackMessage, Retryable: true}

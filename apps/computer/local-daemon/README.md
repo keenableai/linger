@@ -181,10 +181,14 @@ model.
   with that code; the model's next accepted job, or a row that moved on,
   drops them. They live in memory, so after a Daemon restart the row shows
   only its code.
-- Pi. The Daemon sets `PI_CODING_AGENT_DIR` on `localmodels` tool calls
-  through `OverlayEnvironment` and `workspace.PiSourceEnvironment` so loaded
-  models land in the profile Pi probes and runs. When a model is loaded on a
-  Computer with Pi enabled and not yet installed, `internal/localmodels`
+- Pi. The Daemon sets `PI_CODING_AGENT_DIR` on `localmodels` tool calls only
+  when a managed `gateway-home/.pi/agent` profile exists (checking
+  `LOCALMODELS_TOOLS_DIR`, `StateDirectory`, a managed `gateway-home` entry in
+  the base environment, and `<HOME|USERPROFILE>/.local/share/localmodels/tools/gateway-home/.pi/agent`),
+  and otherwise omits it so `localmodels` defaults consistently to
+  `tools/gateway-home/.pi/agent` without inheriting a stale `byok-home` profile
+  or writing to personal `~/.pi/agent`. When a model is loaded on a Computer
+  with Pi enabled and not yet installed, `internal/localmodels`
   installs the pinned Pi runtime asynchronously in the background under
   `HarnessRoot` (passing the bundled Node binary via `--node` when available,
   matching the installer's 2 m status/plan and 20 m apply budgets, and backing
@@ -199,19 +203,27 @@ model.
 
 `internal/localmodels/source.go` runs `localmodels source status|check|models|apply`
 for `execute` commands of kind `model_source`, on their own goroutine so they
-never block Operation commands; `apply` is serialized, maps apply timeouts to
-`MODEL_SOURCE_TIMEOUT`, scrubs any submitted BYOK API key from tool error
-messages before they leave the Computer, and logs structured refusal codes. A BYOK key reaches the
-tool on stdin, never in argv or logs, together with the address as base URL,
-path and endpoint and the protocol the owner's client chose; `check` sends one
-request there and `models` lists base URL + path + `/models`. The BYOK summary
-carries `path` and `endpoint` only after a `runner.welcome` that names the
-`byok_endpoint` service feature. `localmodels` writes
+never block Operation commands; `apply` is serialized, maps timeouts to
+`MODEL_SOURCE_TIMEOUT`, scrubs submitted BYOK API keys, secrets, URL query
+strings/userinfo, and user-home paths (preserving benign system binary paths)
+from tool error messages before they leave the Computer, and logs structured
+refusal codes. Read-only `status`, `check`, and `models` calls use 40 s budgets
+inside the Runner Gateway's 45 s timeout, and `apply` (including its post-apply
+synchronous Runtime discovery) fits inside a 165 s total budget under the
+Gateway's 180 s timeout. Output decoding scans sequential JSON documents so
+JSONL progress lines followed by pretty-printed JSON parse reliably. A BYOK key
+reaches the tool on stdin, never in argv or logs, together with the address as
+base URL, path and endpoint and the protocol the owner's client chose; `check`
+sends one request there and `models` lists base URL + path + `/models`. The BYOK
+summary carries `path` and `endpoint` only after a `runner.welcome` that names
+the `byok_endpoint` service feature. `localmodels` writes
 `<state>/model-source.json`; the Daemon only adds the `runtime_paths` that the
 same `apply` reported. It re-reads the file on every discovery tick to overlay
 the Runtimes' environment (`OverlayEnvironment`) and executable paths
-(`OverlayRuntimePaths`), and under BYOK lists only the BYOK model in each
-Runtime's catalog.
+(`OverlayRuntimePaths`), dropping any stale `byok-home` entry in `local` mode
+in favor of the managed `gateway-home` Pi profile, never falling back to cloud
+models in `local` mode (`agentRuntimeModel`), and under BYOK listing only the
+BYOK model in each Runtime's catalog.
 
 Before a Run or model call on a Runtime whose profile is the BYOK source's,
 the Daemon checks the saved loopback gateway's `/health` (`EnsureGateway` in
