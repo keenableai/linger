@@ -106,7 +106,10 @@ Go service owning Human HTTP/SSE, Agent callbacks, and active product state.
   `teamhub room handoff`): TeamHub posts a hidden `agent_runtime` message,
   authored by the Human and mentioning the AnotherMe, in another live Room
   where both are members, and it wakes the AnotherMe's Context there, which
-  then speaks for itself. Only a Run whose inputs carry a message the Human
+  then speaks for itself. `teamhub message read --list-inboxes` returns each
+  authorized Room's display `name` alongside `inbox_id` so AnotherMe can
+  resolve a natural-language Room name to `room:<room-id>` before handing off.
+  Only a Run whose inputs carry a message the Human
   wrote, or a card they decided, in the direct chat may hand off
   (`X-TeamHub-Run-Id`); proactive wakes, Routines and Task callbacks may not,
   because they often carry outside content. A refusal names its reason in an

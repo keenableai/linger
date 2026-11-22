@@ -2215,6 +2215,7 @@ type AgentGetAgentRequest struct {
 type AgentHistoryInbox struct {
 	InboxId string                `json:"inbox_id"`
 	Kind    AgentHistoryInboxKind `json:"kind"`
+	Name    *string               `json:"name,omitempty"`
 }
 
 // AgentHistoryInboxKind defines model for AgentHistoryInbox.Kind.
